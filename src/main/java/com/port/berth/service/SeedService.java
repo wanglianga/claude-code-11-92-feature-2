@@ -1,6 +1,7 @@
 package com.port.berth.service;
 
 import com.port.berth.repo.CatalogDao;
+import com.port.berth.repo.HazmatDao;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.ApplicationArguments;
@@ -29,15 +30,25 @@ public class SeedService implements ApplicationRunner {
 
     private final JdbcTemplate jdbc;
     private final CatalogDao catalogDao;
+    private final HazmatDao hazmatDao;
 
-    public SeedService(JdbcTemplate jdbc, CatalogDao catalogDao) {
+    @org.springframework.beans.factory.annotation.Autowired
+    public SeedService(JdbcTemplate jdbc, CatalogDao catalogDao, HazmatDao hazmatDao) {
         this.jdbc = jdbc;
         this.catalogDao = catalogDao;
+        this.hazmatDao = hazmatDao;
+    }
+
+    /**兼容既有两参构造（旧测试/调用）；危货 DAO 用同一 JdbcTemplate 自建。*/
+    public SeedService(JdbcTemplate jdbc, CatalogDao catalogDao) {
+        this(jdbc, catalogDao, new HazmatDao(jdbc));
     }
 
     @Override
     public void run(ApplicationArguments args) {
         seedIfEmpty();
+        // 危货堆区是独立子域：老库已有用户时也按需补播，不被 app_user 计数短路
+        hazmatDao.seedIfEmpty();
     }
 
     public synchronized void seedIfEmpty() {
@@ -57,7 +68,8 @@ public class SeedService implements ApplicationRunner {
                 RESTART IDENTITY CASCADE
                 """);
         seedAll();
-        log.info("场景已重置并重新播种");
+        hazmatDao.resetAndSeed();
+        log.info("场景已重置并重新播种（含危货堆区）");
     }
 
     // ====================================================================

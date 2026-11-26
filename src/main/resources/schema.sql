@@ -275,3 +275,81 @@ CREATE TABLE IF NOT EXISTS impact_item (
     handled     BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE INDEX IF NOT EXISTS idx_impact_disruption ON impact_item(disruption_id);
+
+-- ====================================================================
+-- 危货临时堆区：堆位 / 距离 / 货类隔离 / 占用 / 清场凭证 / 消防通道
+-- （特性 92-feature-2：固定专用区 vs 清场分时共享 Y1 两种接货安排对照）
+-- ====================================================================
+
+CREATE TABLE IF NOT EXISTS hz_yard (
+    id                BIGSERIAL PRIMARY KEY,
+    code              VARCHAR(16) NOT NULL UNIQUE,   -- Y1 / Y2 / Z
+    name              VARCHAR(64) NOT NULL,
+    capacity_t        NUMERIC(6,1) NOT NULL,         -- 20 / 15 / 15 吨
+    dedicated_class   VARCHAR(16),                   -- JIA / YI / BING；NULL=通用
+    shared_clearance  BOOLEAN NOT NULL DEFAULT FALSE,-- 是否允许清场后跨类分时共享
+    access_road_code  VARCHAR(32),                   -- 关联 hz_road_state.code
+    sort_no           INT NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS hz_yard_distance (
+    id          BIGSERIAL PRIMARY KEY,
+    yard_a      VARCHAR(16) NOT NULL,
+    yard_b      VARCHAR(16) NOT NULL,
+    distance_m  INT NOT NULL                         -- Y1-Y2=30；Y1-Z=55；Y2-Z=58（Z 距两者 >50）
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_hz_distance_pair
+    ON hz_yard_distance(LEAST(yard_a, yard_b), GREATEST(yard_a, yard_b));
+
+CREATE TABLE IF NOT EXISTS hz_cargo (
+    id                 BIGSERIAL PRIMARY KEY,
+    code               VARCHAR(16) NOT NULL UNIQUE,  -- JIA / YI
+    name               VARCHAR(64) NOT NULL,
+    haz_class          VARCHAR(16) NOT NULL,
+    tons               NUMERIC(6,1) NOT NULL,        -- 12 / 10
+    arrived_at         TIMESTAMP,
+    transfer_approved  BOOLEAN NOT NULL DEFAULT TRUE,-- 获批转运车
+    note               TEXT
+);
+
+CREATE TABLE IF NOT EXISTS hz_isolation_rule (
+    id               BIGSERIAL PRIMARY KEY,
+    class_a          VARCHAR(16) NOT NULL,
+    class_b          VARCHAR(16) NOT NULL,
+    min_distance_m   INT NOT NULL                    -- 甲乙类必须隔离 50m
+);
+
+CREATE TABLE IF NOT EXISTS hz_occupation (
+    id            BIGSERIAL PRIMARY KEY,
+    yard_code     VARCHAR(16) NOT NULL,
+    cargo_code    VARCHAR(16),
+    haz_class     VARCHAR(16),
+    owner_label   VARCHAR(128),
+    kind          VARCHAR(16) NOT NULL DEFAULT 'CARGO', -- CARGO / OPERATION
+    tons          NUMERIC(6,1) NOT NULL DEFAULT 0,
+    start_at      TIMESTAMP,
+    end_at        TIMESTAMP,                          -- 计划结束
+    departed_at   TIMESTAMP,                          -- 实际离场证明时间
+    created_at    TIMESTAMP NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_hz_occ_yard ON hz_occupation(yard_code);
+
+CREATE TABLE IF NOT EXISTS hz_clearance (
+    id                 BIGSERIAL PRIMARY KEY,
+    yard_code          VARCHAR(16) NOT NULL UNIQUE,
+    cert_no            VARCHAR(40),
+    planned_ready_at   TIMESTAMP,                    -- 计划清场复核完成（Y1=10:20）
+    certified_at       TIMESTAMP,                    -- 凭证实际出具/生效时间（迟到会晚于计划）
+    review_passed      BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at         TIMESTAMP NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS hz_road_state (
+    id           BIGSERIAL PRIMARY KEY,
+    code         VARCHAR(32) NOT NULL UNIQUE,
+    name         VARCHAR(64) NOT NULL,
+    is_clear     BOOLEAN NOT NULL DEFAULT TRUE,       -- 消防通道是否畅通
+    checked_at   TIMESTAMP,
+    restore_at   TIMESTAMP,                           -- 已知恢复时间；NULL=未知
+    reason       TEXT
+);

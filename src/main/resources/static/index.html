@@ -42,7 +42,8 @@
       <button data-tab="planner" class="tab" onclick="switchTab('planner')">② 调度工作台</button>
       <button data-tab="team" class="tab" onclick="switchTab('team')">③ 班组看板</button>
       <button data-tab="sim" class="tab" onclick="switchTab('sim')">④ 模拟与扰动</button>
-      <button data-tab="replay" class="tab" onclick="switchTab('replay')">⑤ 一键回放验证</button>
+      <button data-tab="hazmat" class="tab" onclick="switchTab('hazmat')">⑤ 危货堆区接货</button>
+      <button data-tab="replay" class="tab" onclick="switchTab('replay')">⑥ 一键回放验证</button>
     </nav>
     <div class="topbar-right">
       <span id="current-user" class="user-badge"></span>
@@ -149,7 +150,104 @@
       </div>
     </section>
 
-    <!-- ⑤ 回放 -->
+    <!-- ⑤ 危货堆区接货对照 -->
+    <section id="tab-hazmat" class="tab-panel">
+      <style>
+        .hz-banner { border-radius:10px; padding:10px 14px; margin:10px 0; font-size:14px; line-height:1.7;
+          background:linear-gradient(90deg,#eef6ff,#f4fbff); border:1px solid #cfe6ff; }
+        .hz-cards { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:12px 0; }
+        @media (max-width:1100px){ .hz-cards { grid-template-columns:1fr; } }
+        .hz-arr { border:1px solid #e3e8ef; border-radius:12px; padding:14px 16px; background:#fff; }
+        .hz-arr.win { border-color:#34a853; box-shadow:0 0 0 2px rgba(52,168,83,.12); }
+        .hz-arr h3 { margin:0 0 4px; font-size:16px; }
+        .hz-big { font-size:26px; font-weight:800; margin:6px 0 2px; }
+        .hz-big.good { color:#1e8e3e; } .hz-big.wait { color:#b06000; }
+        .hz-sub { color:#667085; font-size:13px; line-height:1.6; margin-bottom:8px; }
+        .hz-rej { border-top:1px dashed #e6e9ef; padding:8px 0; font-size:13px; }
+        .hz-rej:first-of-type{ border-top:none; }
+        .hz-yardline { display:flex; justify-content:space-between; gap:8px; align-items:baseline; }
+        .hz-codes { margin:4px 0 0; padding-left:0; list-style:none; }
+        .hz-codes li { background:#fdecec; color:#b3261e; border-radius:6px; padding:2px 8px; margin:3px 4px 3px 0;
+          display:inline-block; font-size:12px; }
+        .hz-codes li.ok { background:#e6f4ea; color:#1e6b33; }
+        .hz-yard-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:10px; }
+        @media (max-width:1100px){ .hz-yard-grid { grid-template-columns:1fr; } }
+        .hz-yard { border:1px solid #e3e8ef; border-radius:12px; padding:12px 14px; background:#fff; }
+        .hz-yard.s-AVAILABLE { border-color:#34a853; background:#f6fff8; }
+        .hz-yard.s-locked { border-color:#d9a300; background:#fffdf2; }
+        .hz-yard.s-block { border-color:#d93025; background:#fff7f6; }
+        .hz-status { display:inline-block; border-radius:999px; padding:3px 10px; font-size:12px; font-weight:700; }
+        .hz-status.AVAILABLE { background:#1e8e3e; color:#fff; }
+        .hz-status.locked { background:#f9ab00; color:#3a2c00; }
+        .hz-status.block { background:#d93025; color:#fff; }
+        .hz-meter { height:8px; border-radius:6px; background:#eef1f5; overflow:hidden; margin:6px 0 2px; }
+        .hz-meter > i { display:block; height:100%; background:#4c8bf5; }
+        .hz-gate { font-size:12.5px; display:flex; gap:6px; align-items:flex-start; margin:3px 0; color:#3c4656; }
+        .hz-gate .ic { font-weight:800; } .hz-gate.OK .ic{color:#1e8e3e;} .hz-gate.WAIT .ic{color:#b06000;}
+        .hz-gate.BLOCK .ic{color:#d93025;}
+        .hz-tl { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+        .hz-tl th,.hz-tl td { border:1px solid #e8ebf1; padding:5px 8px; text-align:center; }
+        .hz-tl th { background:#f6f8fb; }
+        .hz-result { margin-top:10px; border-radius:10px; padding:10px 14px; font-size:14px; line-height:1.7; }
+        .hz-result.ok { background:#e6f4ea; border:1px solid #b7dfc1; }
+        .hz-result.err { background:#fdecea; border:1px solid #f3c1bd; }
+      </style>
+      <div class="card">
+        <div class="row-between wrap">
+          <h2>危货临时堆区 · 能不能接货：相容性 / 50m 隔离 / 容量 / 转运道路 / 清场凭证</h2>
+          <div class="row gap wrap">
+            <label class="hint">观察时刻
+              <input id="hz-at" type="datetime-local" value="2026-11-26T10:20" style="margin-left:6px" />
+            </label>
+            <button class="btn primary" onclick="loadHazmat()">刷新对照 / 看板</button>
+          </div>
+        </div>
+        <div id="hz-story" class="hz-banner"></div>
+        <div class="row gap wrap">
+          <button class="btn warn" onclick="hzLateCert()">⏰ 模拟清场凭证迟到（实际 10:40 生效）</button>
+          <button class="btn" onclick="hzOnTimeCert()">恢复准时凭证（10:20）</button>
+          <button class="btn danger" onclick="hzBlockRoad()">阻断 Y1 消防通道</button>
+          <button class="btn success" onclick="hzClearRoad()">恢复通道畅通</button>
+          <button class="btn" onclick="hzReset()">↺ 重置危货场景</button>
+        </div>
+        <div id="hz-conclusion"></div>
+      </div>
+
+      <div class="hz-cards" id="hz-compare"></div>
+
+      <div class="card">
+        <h2>关键时刻占用量（吨）</h2>
+        <div id="hz-timeline"></div>
+      </div>
+
+      <div class="card">
+        <h2>堆位可用性看板</h2>
+        <p class="hint">不变量：清场凭证迟到/缺失时，即使越过计划 10:20，Y1 的 <code>available</code> 仍为 false、状态绝不是“可接货”。</p>
+        <div id="hz-yards" class="hz-yard-grid"></div>
+      </div>
+
+      <div class="card">
+        <h2>尝试接乙货（真实事务校验）</h2>
+        <div class="row gap wrap">
+          <label>安排
+            <select id="hz-strategy">
+              <option value="TIME_SHARED_CLEARANCE" selected>按清场时间共享 Y1</option>
+              <option value="FIXED_DEDICATED">固定专用区</option>
+            </select>
+          </label>
+          <label>指定堆位（可空＝选最早可行）
+            <select id="hz-yard">
+              <option value="">（自动选择）</option>
+              <option>Y1</option><option>Y2</option><option>Z</option>
+            </select>
+          </label>
+          <button class="btn primary" onclick="hzTryReceive()">在“观察时刻”尝试接乙货 10t</button>
+        </div>
+        <div id="hz-receive-result"></div>
+      </div>
+    </section>
+
+    <!-- ⑥ 回放 -->
     <section id="tab-replay" class="tab-panel">
       <div class="card">
         <h2>固定样例一键回放</h2>
@@ -161,6 +259,7 @@
         <div class="row gap wrap">
           <button class="btn primary big" id="btn-orderings" onclick="runReplay('orderings')">▶ 回放三种顺序 + 并发/策略对照</button>
           <button class="btn warn big" id="btn-disruptions" onclick="runReplay('disruptions')">▶ 回放潮汐/岸桥扰动</button>
+          <button class="btn primary big" id="btn-hazmat" onclick="runReplay('hazmat')">▶ 回放危货堆区对照/凭证闸门</button>
           <button class="btn success big" id="btn-full" onclick="runReplay('full')">▶ 完整回放</button>
           <button class="btn danger" onclick="resetScenario()">重置样例数据</button>
         </div>

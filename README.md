@@ -6,6 +6,11 @@
 设备工作区间/转场/周转，并提供潮汐修订、岸桥故障、改靠、ETA 迟到的影响分析与版本化重排；
 已完成的引航/装卸记录在应用层与数据库触发器双层保证不可覆盖。
 
+> **特性 92-feature-2（危货临时堆区接货对照）**：新增独立的危货堆区子域，对 **固定专用区** 与
+> **按清场时间共享 Y1** 两种安排，给出乙货的**可接货时间、各堆位占用量与结构化被拒理由**，
+> 并把“**清场凭证迟到/缺失时，堆位绝不能显示为可用**”实现为引擎硬不变量、REST 闸门与 29 条回放断言。
+> 详见第 11 节。
+
 - 后端：Java（`--release 21`，已在预装 **JDK 25.0.1** 上构建运行）、Spring Boot 3.5.7、Spring JDBC、PostgreSQL
 - 前端：`src/main/resources/static/` 原生 HTML/CSS/JS 单页（无需 Node 构建）
 - 接口文档：springdoc-openapi，`/swagger-ui.html`
@@ -85,12 +90,14 @@ src/main/java/com/port/berth/
   PortBerthApplication.java
   config/                         # 鉴权拦截器、CORS、OpenAPI、PG 触发器初始化
   domain/                         # 枚举、Catalog 记录、Eval、ConstraintMath
-  repo/                           # CatalogDao / PlanDao（JdbcTemplate + 行映射）
+  hazmat/                         # 【特性2】危货堆区模型 + HazmatEngine 纯函数判定（容量/隔离/凭证/道路）
+  repo/                           # CatalogDao / PlanDao / HazmatDao（JdbcTemplate + 行映射）
   service/                        # PlanningEngine / PlanService / HoldSweeper
                                   # ExecutionService / DisruptionService / ReplanService
-                                  # ReplayService / SeedService / AuthService
-  web/                            # REST 控制器、全局异常处理
-src/test/java/.../                # 4 个纯单元测试（约束数学 + 样例唯一窗口规格）
+                                  # ReplayService / HazmatService / HazmatReplayService
+                                  # SeedService / AuthService
+  web/                            # REST 控制器（含 HazmatController）、全局异常处理
+src/test/java/.../                # 11 个纯单元测试：约束数学 + 样例唯一窗口 + 7 个危货堆区规格
 ```
 
 ---
@@ -100,7 +107,7 @@ src/test/java/.../                # 4 个纯单元测试（约束数学 + 样例
 ### 5.1 Docker Compose（推荐，干净环境）
 
 ```bash
-cd /workspace/92
+cd /workspace/92-feature-2
 docker compose up --build
 ```
 
@@ -125,7 +132,7 @@ PostgreSQL 18 已在 `127.0.0.1:5432` 运行，开发库/账号 `ccdev/ccdev`：
 # 若数据库进程未运行，可尝试：
 # /opt/postgresql-18/bin/pg_ctl -D /tmp/cc-services/postgres -l /tmp/pg.log start
 
-cd /workspace/92
+cd /workspace/92-feature-2
 export JAVA_HOME=/opt/jdk-25
 mvn spring-boot:run
 # 或：mvn package && /opt/jdk-25/bin/java -jar target/berth-coordination.jar
@@ -168,7 +175,9 @@ TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/auth/login \
 
 ```bash
 mvn test
-# Tests run: 4, Failures: 0, Errors: 0, Skipped: 0  → BUILD SUCCESS
+# Tests run: 11, Failures: 0, Errors: 0, Skipped: 0  → BUILD SUCCESS
+#   其中 HazmatEngineTest 7 个，锁定 10:20 vs 11:00、40 分钟差、30m 隔离、
+#   凭证迟到/缺失、消防通道阻断、缺离场证明、容量超限等规格
 
 mvn package
 # 生成 target/berth-coordination.jar（约 28 MB，Spring Boot fat jar）
@@ -177,9 +186,12 @@ mvn package
 ```bash
 # 启动 jar 后执行（默认 http://127.0.0.1:8080）
 bash scripts/replay.sh
-# ==> 断言：46/46 通过；allPassed=True
+# ==> 断言：75/75 通过；allPassed=True
 # ALL_REPLAY_CHECKS_PASSED
 ```
+
+> 75 = 原有靠泊/扰动 46 条 + 危货堆区新增 29 条（对照 12、凭证闸门 9、道路 3、接货 5）。
+> 危货回放每块只重置 `hz_*` 子域，**不会清空登录 token**；`POST /api/replays/hazmat` 可单独运行。
 
 该脚本真实登录、调用 `POST /api/replays/full`（约 12 秒，含真实 2s TTL 等待、
 500ms 扫描释放与双线程并发确认竞速），递归统计全部断言并以退出码反映结果。
@@ -193,6 +205,18 @@ bash scripts/replay.sh
 - 前端 `node --check app.js` 通过；所有按钮处理函数均有定义；`/`、`/app.js`、`/styles.css`、
   `/swagger-ui/index.html` 均实际返回 200。
 - 回放中包含**数据库层自证不可变**：对 `work_record` 直接 `UPDATE/DELETE` 被触发器拒绝。
+- **危货堆区 HTTP 端到端（本次实际执行）**：匿名 `GET /api/hazmat/comparison` 返回 401；
+  `agent` 调 `PUT /api/hazmat/yards/Y1/clearance` 返回 403；dispatch 下基线 `Y1@10:20` 为
+  `available=true/AVAILABLE`；把凭证改登为实际 `10:40` 生效后，`10:20` 与 `10:39` 均为
+  `available=false/CERT_LATE` 且 `certificateLate=true`，`10:40` 才恢复可用；此时
+  `POST /api/hazmat/receiving`（Y1/共享/10:20）返回 409 `HAZMAT_REJECTED` 且 details 含
+  `CLEARANCE_CERT_LATE`；恢复准时凭证后同请求 `accepted=true` 并写入 `hz_occupation`。
+- **危货全新空库复验（本次实际执行）**：另建空库 `ccdev_hzfresh`、`PORT=8081` 启动 fat jar，
+  `hz_*` 七张表与播种一次成功，`POST /api/replays/hazmat` 在该空库 `allPassed=true`；验证后已停实例并删除该临时库。
+- **前端危货面板（本次实际执行）**：`node --check app.js` 通过；并用 Node `vm` + DOM 桩拿真实
+  `/api/hazmat/comparison`、`/yards`（准时与迟到两份）响应实际执行 `renderHzCompare/renderHzTimeline/renderHzYards`，
+  12 项渲染断言全过（含 `10:20/11:00`、`ZONE_DEDICATED/ISOLATION_*`、`12/20、15/15`、迟到态“凭证迟到未生效”）；
+  `index.html` 内所有 `onclick` 处理函数与 `hz-*` 元素 ID 静态一致性检查通过。本环境无无头浏览器，未做真实像素/点击验证。
 
 ### 7.2 界面手工验证路径
 
@@ -205,8 +229,16 @@ bash scripts/replay.sh
 3. **③ 班组看板**：只有 `CONFIRMED` 方案出现；可开工、登记部分作业量、完成分段。
 4. **④ 模拟与扰动**：修订 21:00 潮位为 `2.20`、插入 QC-2 故障窗口、查看影响项；
    回到调度页对确认方案“扰动后重排”，或用确认卡上的“改靠/改时”。
-5. **⑤ 一键回放验证**：三个按钮分别运行顺序集/扰动集/完整集，页面渲染每条断言与完整 JSON。
-6. **① 船代申报**：可新建船次、对 VOY-E 把 ETA 18–19 补报为 19–20、撤回授权。
+5. **⑤ 危货堆区接货**：顶部两张对照卡直接给出 固定专用区 `乙 11:00→Z` 与 清场共享 `乙 10:20→Y1（提早40分钟）`，
+   每块卡列出 Y1/Y2/Z 的原因码与中文理由；中部是 09:00/10:00/10:20/11:00 占用量表，下部是三块堆位看板与
+   “离场/清场凭证/消防通道/隔离”闸门清单。把观察时刻设为 `10:20`：
+   - 默认准时凭证时 Y1 绿色 `AVAILABLE/可接货`；点 **⏰ 模拟凭证迟到（实际10:40）** 后不改动观察时刻，
+     Y1 立即变琥珀色 `清场凭证迟到未生效·不可用 / CERT_LATE`，证明“越过计划 10:20 也不显示可用”；
+     把时刻调到 `10:40` 才转绿。
+   - 点 **阻断消防通道**，Y1 变红 `ROAD_BLOCKED`；用底部“尝试接乙货”可看到 409 与结构化理由。
+   - “尝试接乙货”选 `FIXED_DEDICATED + Y1@10:20` 必被 `ZONE_DEDICATED` 拒；选共享 Y1@10:20 成功落库。
+6. **⑥ 一键回放验证**：顺序集 / 扰动集 / **危货堆区** / 完整集按钮分别运行对应回放，页面渲染每条断言与完整 JSON。
+7. **① 船代申报**：可新建船次、对 VOY-E 把 ETA 18–19 补报为 19–20、撤回授权。
 
 ---
 
@@ -226,6 +258,7 @@ bash scripts/replay.sh
 | **岸桥故障** | QC-2 20:45–22:30 故障生成 `CRANE_FAULT`；重排为 `SAME_SLOT_REASSIGN`，新分配含 QC-3 不含 QC-2；引航记录保留 |
 | **改靠指令** | 对 VOY-D 下达改靠 B2↔B3：新版本确认且泊位变化；≥4 条 `BERTH_CHANGE` 逐段影响说明 |
 | **ETA 迟到** | ETA 最早时间晚于计划靠泊点时生成 ≥4 条 `ETA_LATE`（引航/拖轮/靠泊/装卸），随后重排出 `CONFIRMED v2` |
+| **危货堆区对照（本特性，29 条）** | 固定专用→乙 `Z 11:00`（等 120m），Y1 `ZONE_DEDICATED`、Y2 `ISOLATION_DISTANCE_INSUFFICIENT 30<50`、Z `YARD_OCCUPIED_UNTIL`；共享 Y1→`10:20`（等 80m）、提早 40m；09:00 占用 Y1=12/20、Z=15/15；凭证改晚到 10:40 后 10:20/10:39 仍 `available=false/CERT_LATE`、10:40 才可用、对照最早时间顺延 10:40；凭证缺失时 11:00 仍 `CERT_MISSING`；消防通道阻断→`ROAD_BLOCKED/FIRE_LANE_BLOCKED` 且接货 409、恢复后可用；固定 Y1/10:20、Z/10:20、共享 Y1/10:19 强接分别 409 且原因码正确，Y1/10:20 成功并写 `hz_occupation` |
 
 ---
 
@@ -251,8 +284,17 @@ bash scripts/replay.sh
 | `POST /api/plans/{id}/replan` | DISPATCHER+ | 扰动重排（默认自动确认） |
 | `POST /api/plans/{id}/change-berth` | DISPATCHER+ | 改靠/改时指令 |
 | `GET /api/disruptions[/{id}]` | 登录 | 扰动与影响项 |
-| `POST /api/replays/orderings|disruptions|full` | DISPATCHER+ | 一键回放 |
-| `POST /api/admin/reset` | DISPATCHER+ | 清空并恢复固定样例 |
+| `GET /api/hazmat/scenario` | 登录 | 危货堆区固定事实：Y1/Y2/Z、距离矩阵、隔离规则、货物、占用、凭证、道路 |
+| `GET /api/hazmat/comparison`（别名 `/compare`）`?at=` | 登录 | **两种安排对照**：可接货时间/等待分钟/占用时间轴/每堆位原因码与中文理由 |
+| `GET /api/hazmat/yards`、`GET /api/hazmat/yards/{code}` `?at=` | 登录 | 堆位（看板/单个）可用性：`available/status/gates/reasons` 与凭证生效/迟到标记；`at` 缺省 `10:20` |
+| `PUT /api/hazmat/yards/{code}/clearance` | DISPATCHER+ | 登记清场凭证：`{certNo,plannedReadyAt,certifiedAt,reviewPassed}`；`certifiedAt` 晚于计划即“迟到” |
+| `POST /api/hazmat/scenario/late-certificate` / `.../on-time-certificate` | DISPATCHER+ | 一键把 Y1 凭证设为“实际 10:40 迟到” / 恢复“10:20 准时” |
+| `POST /api/hazmat/roads/{code}` | DISPATCHER+ | 设置消防通道/转运道路 `{clear,reason,restoreAt}` |
+| `POST /api/hazmat/yards/{code}/departure` | DISPATCHER+ | 登记前批货实际离场证明 `{departedAt}` |
+| `POST /api/hazmat/receiving` | DISPATCHER+ | 尝试接货 `{cargoCode,strategy,yardCode,at}`；不满足返回 409 `HAZMAT_REJECTED`+理由数组 |
+| `POST /api/hazmat/reset` | DISPATCHER+ | 仅把 `hz_*` 子域恢复固定样例（不动靠泊数据/登录态） |
+| `POST /api/replays/orderings|disruptions|hazmat|full` | DISPATCHER+ | 一键回放（`full` 现含危货块，共 75 条断言） |
+| `POST /api/admin/reset` | DISPATCHER+ | 清空并恢复固定样例（含危货子域；会重建账号并使旧 token 失效，重新登录即可） |
 
 ---
 
@@ -263,4 +305,81 @@ bash scripts/replay.sh
   均可用同名环境变量覆盖（`HOLD_ON_STAGE`、`HOLD_TTL_SECONDS` …）。
 - `HoldSweeper` 每 500ms 扫描 `STAGED` 且到期的方案，释放其 `TENTATIVE` 占用并写 `HOLD_EXPIRED` 事件。
 - `ccdev/ccdev` 是任务容器的隔离开发账号，**不要直接作为生产配置**；Compose 使用独立的 `berth` 库与密码。
+
+---
+
+## 11. 危货临时堆区接货对照（特性 92-feature-2）
+
+### 11.1 固定事实（播种于 `hz_*` 表，`HazmatDao`）
+
+| 要素 | 数据 |
+| --- | --- |
+| 堆位 / 容量 | **Y1=20t、Y2=15t、Z=15t** |
+| 距离 | Y1↔Y2=**30m**；Y1↔Z=55m、Y2↔Z=58m（**Z 距两者均 >50m**） |
+| 隔离规则 | 甲类 ↔ 乙类 ≥ **50m** |
+| 到港货物 | 甲 `JIA` **12t**、乙 `YI` **10t**，同为 2026-11-26 **09:00** 到港；转运车已获批 |
+| 甲的动线 | 09:00 进 Y1 → **10:00** 实际离场送场外合规区（有 `departed_at` 证明） |
+| Y1 清场 | 计划复核完成 **10:20**；凭证 `CL-Y1-1020` 准时 10:20 生效 |
+| Z | 既有作业（检修/倒垛，占 15t）**08:00–11:00** |
+| 道路 | `FIRE-Y1` 消防通道/转运道路，基线巡查畅通 |
+
+### 11.2 两种安排的结论（`GET /api/hazmat/comparison`）
+
+| 安排 | 乙最早可接货 | 堆位 / 接入占用 | 等待（自 09:00） | 各堆位被拒理由（在到港时刻评估） |
+| --- | --- | --- | --- | --- |
+| **固定专用区** `FIXED_DEDICATED` | **11:00** | **Z**，10/15t（67%） | 120 分钟 | **Y1** `ZONE_DEDICATED`（甲类固定专用，不跨类）＋当时 `YARD_OCCUPIED_UNTIL 10:00`；**Y2** `YARD_NOT_DESIGNATED` ＋ `ISOLATION_DISTANCE_INSUFFICIENT`（距 Y1 甲货 30m<50m）；**Z** `YARD_OCCUPIED_UNTIL 11:00` |
+| **清场分时共享 Y1** `TIME_SHARED_CLEARANCE` | **10:20** | **Y1**，10/20t（50%） | 80 分钟 | Y1 依次过 `YARD_OCCUPIED_UNTIL 10:00`→`DEPARTURE`→`CLEARANCE_CERT`（10:20）→`FIRE_LANE`；**Y2** 仍 `YARD_NOT_DESIGNATED`＋`ISOLATION_*`；**Z** 仍占用至 11:00 |
+
+**比较结论：共享 Y1 比固定专用死等 Z 提早 40 分钟接乙货。**
+
+关键时刻占用量（`occupancyTimeline`）：
+
+| 时刻 | Y1 | Y2 | Z |
+| --- | --- | --- | --- |
+| 09:00 到货 | **12/20t（甲）** | 0/15t | **15/15t（既有作业）** |
+| 10:00 甲离场 | 0/20t（物理清空，待凭证） | 0 | 15/15t |
+| 10:20 计划清场完成 | 凭证准时→可接乙 10/20t | 0 | 15/15t |
+| 11:00 Z 腾空 | 乙 10/20t（共享安排） | 0 | 固定安排接乙 10/15t |
+
+### 11.3 清场凭证迟到不变量（强制）
+
+`HazmatEngine` 只认真实凭证的实际生效时间 `clearance.certifiedAt`，**计划时间 `plannedReadyAt` 不参与可用性判定**：
+
+- 凭证准时（`certifiedAt=10:20`）：`at=10:20` 起 Y1 `available=true / AVAILABLE`。
+- 凭证迟到（如 `certifiedAt=10:40`）：`10:20` 与 `10:39` 一律 `available=false / CERT_LATE`
+  （原因码 `CLEARANCE_CERT_LATE`，并带 `certificateLate=true`），**10:40 才转可用**，
+  对照中的共享最早时间也顺延为 10:40（仍早于 11:00）。
+- 凭证缺失或复核未过：即使查询时刻已到 11:00，Y1 仍 `available=false`，状态 `CERT_MISSING/CLEARANCE_FAILED`，
+  且 `earliestAcceptAt=null`（不会拿计划时间瞎承诺）。
+- 消防通道不畅通：即便凭证已生效，Y1 仍 `ROAD_BLOCKED / FIRE_LANE_BLOCKED`，接货返回 409。
+
+命令行亲历“迟到不变量”：
+
+```bash
+T=$(curl -s -X POST http://127.0.0.1:8080/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"dispatch","password":"dispatch123"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# 把 Y1 凭证改登为 10:40 才实际生效
+curl -s -X PUT http://127.0.0.1:8080/api/hazmat/yards/Y1/clearance \
+  -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  -d '{"certNo":"CL-LATE","plannedReadyAt":"2026-11-26T10:20:00",
+       "certifiedAt":"2026-11-26T10:40:00","reviewPassed":true}'
+
+# 越过计划 10:20 也必须是 available=false / CERT_LATE
+curl -s "http://127.0.0.1:8080/api/hazmat/yards?at=2026-11-26T10:20" \
+  -H "Authorization: Bearer $T"
+```
+
+### 11.4 代码位置与可测性
+
+- 纯领域模型/引擎（无 Spring、无 DB）：`hazmat/Hazmat.java`、`hazmat/HazmatEngine.java`；
+  规格单测 `src/test/java/com/port/berth/HazmatEngineTest.java`（7 例）。
+- JDBC/播种：`repo/HazmatDao.java`；业务/对照/接货闸门：`service/HazmatService.java`；
+  回放断言：`service/HazmatReplayService.java`；REST：`web/HazmatController.java`。
+- 表结构：`schema.sql` 末尾 `hz_yard / hz_yard_distance / hz_cargo / hz_isolation_rule /
+  hz_occupation / hz_clearance / hz_road_state`，全部 `CREATE TABLE IF NOT EXISTS`，
+  老库重启会按需补播，管理端重置与 `/api/hazmat/reset` 都会恢复本固定样例。
+- 前端：第 **⑤ 危货堆区接货** 页签（`index.html#tab-hazmat` + `app.js` 的 `hz*` 函数）。
 - 服务不依赖 Redis/港口实机/第三方账号；外部潮汐与设备状态全部来自库内模拟表和模拟录入接口。

@@ -152,6 +152,7 @@ function switchTab(tab) {
   if (tab === 'planner') { loadVoyages().then(renderPlannerSelect); }
   if (tab === 'team') { loadBoard(); startTeamTimer(); } else stopTeamTimer();
   if (tab === 'sim') { loadTideTable(); loadDisruptions(); }
+  if (tab === 'hazmat') { loadHazmat(); }
 }
 function startTeamTimer() {
   stopTeamTimer();
@@ -597,7 +598,7 @@ async function resetScenario() {
 /* ---------------- 回放渲染 ---------------- */
 async function runReplay(kind) {
   const btn = $('#btn-' + kind);
-  ['orderings', 'disruptions', 'full'].forEach((k) => { const b = $('#btn-' + k); if (b) b.disabled = true; });
+  ['orderings', 'disruptions', 'hazmat', 'full'].forEach((k) => { const b = $('#btn-' + k); if (b) b.disabled = true; });
   $('#replay-summary').innerHTML = '<div class="verdict ok">⏳ 回放执行中，包含真实 TTL 等待（约 10 秒）与并发竞速…</div>';
   $('#replay-result').innerHTML = '';
   try {
@@ -638,8 +639,14 @@ function renderReplay(data) {
   if (data.disruptions) {
     for (const [k, v] of Object.entries(data.disruptions)) if (k !== 'allPassed') html += renderBlock(k, v);
   }
+  if (data.hazmat) {
+    for (const [k, v] of Object.entries(data.hazmat)) {
+      if (k === 'allPassed' || k === 'scenario') continue;
+      html += renderBlock(k, v);
+    }
+  }
   for (const [k, v] of Object.entries(data)) {
-    if (['orderings', 'disruptions', 'allPassed'].includes(k)) continue;
+    if (['orderings', 'disruptions', 'hazmat', 'allPassed'].includes(k)) continue;
     html += renderBlock(k, v);
   }
   $('#replay-result').innerHTML = html;
@@ -648,6 +655,163 @@ function downloadReplay() {
   const blob = new Blob([JSON.stringify(state.lastReplay, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = 'replay-result.json'; a.click();
+}
+
+/* ---------------- 危货堆区（特性 92-feature-2） ---------------- */
+const HZ_DEFAULT_AT = '2026-11-26T10:20';
+function hzAt() { const el = $('#hz-at'); return (el && el.value) ? el.value : HZ_DEFAULT_AT; }
+function hzQs() { return '?at=' + encodeURIComponent(hzAt()); }
+function hzHM(iso) { return iso ? String(iso).replace('T', ' ').slice(11, 16) : '—'; }
+function hzDayHM(iso) { return iso ? String(iso).replace('T', ' ').slice(5, 16) : '—'; }
+
+async function loadHazmat() {
+  try {
+    const q = hzQs();
+    const [cmp, board] = await Promise.all([
+      api('/api/hazmat/comparison' + q),
+      api('/api/hazmat/yards' + q),
+    ]);
+    state.hzCmp = cmp; state.hzBoard = board;
+    $('#hz-story').innerHTML = `📌 ${esc(cmp.scenario)}<br/>🛡️ ${esc(cmp.certificateGuard.rule)}`;
+    $('#hz-conclusion').innerHTML = `<div class="hz-result ok" style="margin-top:10px">${esc(cmp.conclusionZh)}</div>`;
+    renderHzCompare(cmp);
+    renderHzTimeline(cmp);
+    renderHzYards(board);
+  } catch (e) { showError(e); }
+}
+
+function hzReasonChips(reasons) {
+  if (!reasons || !reasons.length) return '<ul class="hz-codes"><li class="ok">当前时刻满足全部条件</li></ul>';
+  return '<ul class="hz-codes">' + reasons.map((r) =>
+    `<li title="${esc(r.message)}${r.until ? '（解除于 ' + hzHM(r.until) + '）' : ''}">${esc(r.code)}${r.until ? ' →' + hzHM(r.until) : ''}</li>`
+  ).join('') + '</ul>';
+}
+
+function renderHzCompare(cmp) {
+  const list = cmp.arrangements || [];
+  const earliest = list.map((a) => a.earliestAcceptAt).filter(Boolean).sort()[0];
+  $('#hz-compare').innerHTML = list.map((a) => {
+    const win = a.earliestAcceptAt && a.earliestAcceptAt === earliest;
+    const bigCls = win ? 'good' : 'wait';
+    return `<div class="hz-arr ${win ? 'win' : ''}">
+      <div class="hz-yardline"><h3>${win ? '✅ ' : '⏳ '}${esc(a.labelZh)}</h3>
+        <span class="badge ${win ? 'CONFIRMED' : 'STAGED'}">${esc(a.strategy)}</span></div>
+      <div class="hz-big ${bigCls}">${hzHM(a.earliestAcceptAt)} 可接乙货 → ${esc(a.assignedYardCode || '无')}</div>
+      <div class="hz-sub">${esc(a.narrative)}<br/>距 09:00 到货等待 <b>${a.waitMinutesFromArrival == null ? '?' : a.waitMinutesFromArrival + ' 分钟'}</b>
+      ${a.acceptedLoad ? `；接入后 ${esc(a.acceptedLoad.yardCode)} 利用率 ${a.acceptedLoad.utilizationAfterPct}%（${a.acceptedLoad.incomingT}/${a.acceptedLoad.capacityT}t）` : ''}</div>
+      ${(a.rejectionSummary || []).map((r) => `
+        <div class="hz-rej">
+          <div class="hz-yardline"><b>${esc(r.yardCode)}</b>
+            <span class="hint">${r.earliestAcceptAt ? '最早 ' + hzHM(r.earliestAcceptAt) : (r.eligible ? '时间未定（等待外部证明）' : '本安排下不可行')}</span></div>
+          ${hzReasonChips(r.reasons)}
+          ${(r.reasons || []).map((x) => `<div class="hz-sub" style="margin:2px 0">· ${esc(x.message)}</div>`).join('')}
+        </div>`).join('')}
+    </div>`;
+  }).join('');
+}
+
+function renderHzTimeline(cmp) {
+  const tl = cmp.occupancyTimeline || [];
+  if (!tl.length) { $('#hz-timeline').innerHTML = ''; return; }
+  const yards = ['Y1', 'Y2', 'Z'];
+  $('#hz-timeline').innerHTML = `<table class="hz-tl">
+    <tr><th>堆位</th>${tl.map((p) => `<th>${esc(p.label)}<br/><span class="hint">${hzHM(p.at)}</span></th>`).join('')}</tr>
+    ${yards.map((code) => `<tr><td><b>${code}</b></td>${tl.map((p) => {
+      const y = p.yards.find((x) => x.yardCode === code) || {};
+      return `<td>${y.occupiedT}/${y.capacityT}t<div class="hz-meter"><i style="width:${y.utilizationPct || 0}%"></i></div><span class="hint">${y.utilizationPct || 0}%</span></td>`;
+    }).join('')}</tr>`).join('')}
+  </table>`;
+}
+
+function hzBadgeClass(y) {
+  if (y.available) return 'AVAILABLE';
+  if (['ROAD_BLOCKED', 'NOT_DESIGNATED', 'CAPACITY_EXCEEDED', 'CLEARANCE_FAILED'].includes(y.status)) return 'block';
+  return 'locked';
+}
+
+function renderHzYards(board) {
+  $('#hz-yards').innerHTML = (board.yards || []).map((y) => {
+    const bc = hzBadgeClass(y);
+    const icon = { OK: '✓', WAIT: '…', BLOCK: '✕', NA: '–' };
+    return `<div class="hz-yard s-${bc}">
+      <div class="hz-yardline"><b>${esc(y.yardCode)} · ${esc(y.yardName)}</b>
+        <span class="hz-status ${bc}">${esc(y.statusZh)}</span></div>
+      <div class="hz-sub">容量 ${y.capacityT}t ｜ 在堆 ${y.occupiedT}t ｜ 剩余 ${y.remainingT}t
+        ${y.dedicatedClass ? '｜专用 ' + esc(y.dedicatedClass) : '｜非固定专用'}${y.sharedClearance ? '｜可清场共享' : ''}</div>
+      <div class="hz-meter"><i style="width:${y.utilizationPct || 0}%;background:${bc === 'block' ? '#d93025' : bc === 'locked' ? '#f9ab00' : '#1e8e3e'}"></i></div>
+      <div style="margin:8px 0;font-size:14px"><b>${y.available ? '✅ available = true' : '⛔ available = false'}</b>
+        <span class="hint">｜最早可接 ${y.earliestAcceptAt ? hzDayHM(y.earliestAcceptAt) : '时间未定/不可行'}</span></div>
+      ${y.certificateLate ? '<div class="hz-sub" style="color:#b06000">⚠ 清场凭证迟到（certificateLate=true），实际生效 ' + hzHM(y.clearance && y.clearance.certifiedAt) + '</div>' : ''}
+      ${(y.gates || []).filter((g) => ['DEPARTURE', 'CLEARANCE_CERT', 'FIRE_LANE', 'ISOLATION'].includes(g.code)).map((g) => `
+        <div class="hz-gate ${g.state}"><span class="ic">${icon[g.state] || '·'}</span>
+          <span><b>${esc(g.label)}</b><br/><span class="hint">${esc(g.detail || '')}</span></span></div>`).join('')}
+      ${(y.reasons || []).length ? `<div style="margin-top:6px">${hzReasonChips(y.reasons)}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+async function hzPutCert(body) {
+  return api('/api/hazmat/yards/Y1/clearance', { method: 'PUT', body });
+}
+async function hzLateCert() {
+  try {
+    await hzPutCert({ certNo: 'CL-Y1-LATE', plannedReadyAt: '2026-11-26T10:20:00', certifiedAt: '2026-11-26T10:40:00', reviewPassed: true });
+    $('#hz-at').value = '2026-11-26T10:20';
+    toast('⏰ 凭证已登记为 10:40 才生效；请看 10:20 的 Y1 仍为不可用');
+    await loadHazmat();
+  } catch (e) { showError(e); }
+}
+async function hzOnTimeCert() {
+  try {
+    await hzPutCert({ certNo: 'CL-Y1-1020', plannedReadyAt: '2026-11-26T10:20:00', certifiedAt: '2026-11-26T10:20:00', reviewPassed: true });
+    $('#hz-at').value = '2026-11-26T10:20';
+    toast('✅ 已恢复准时凭证（10:20 生效）');
+    await loadHazmat();
+  } catch (e) { showError(e); }
+}
+async function hzBlockRoad() {
+  try {
+    await api('/api/hazmat/roads/FIRE-Y1', { method: 'POST', body: { clear: false, reason: '消防通道被临时堆垛占用（界面演示）' } });
+    toast('🚧 已阻断 Y1 消防通道');
+    await loadHazmat();
+  } catch (e) { showError(e); }
+}
+async function hzClearRoad() {
+  try {
+    await api('/api/hazmat/roads/FIRE-Y1', { method: 'POST', body: { clear: true, reason: '通道已清理，巡查畅通' } });
+    toast('✅ 消防通道恢复畅通');
+    await loadHazmat();
+  } catch (e) { showError(e); }
+}
+async function hzReset() {
+  try {
+    await api('/api/hazmat/reset', { method: 'POST' });
+    $('#hz-at').value = HZ_DEFAULT_AT;
+    $('#hz-receive-result').innerHTML = '';
+    toast('↺ 危货堆区已恢复固定样例');
+    await loadHazmat();
+  } catch (e) { showError(e); }
+}
+async function hzTryReceive() {
+  const box = $('#hz-receive-result');
+  box.innerHTML = '<span class="hint">校验中…</span>';
+  const body = {
+    cargoCode: 'YI',
+    strategy: $('#hz-strategy').value,
+    yardCode: $('#hz-yard').value || null,
+    at: hzAt(),
+  };
+  try {
+    const r = await api('/api/hazmat/receiving', { method: 'POST', body });
+    box.innerHTML = `<div class="hz-result ok">✅ 已接乙货进 <b>${esc(r.yardCode)}</b>，时刻 ${esc(hzHM(r.at))}；占用记录 #${r.occupation && r.occupation.id} 已落库。看板已刷新。</div>`;
+    await loadHazmat();
+  } catch (e) {
+    const details = (e.data && Array.isArray(e.data.details)) ? e.data.details : [];
+    box.innerHTML = `<div class="hz-result err">❌ <b>${esc(e.data && e.data.code || 'REJECTED')}</b>：${esc(e.message)}
+      ${details.length ? '<ul class="hz-codes" style="margin-top:6px">' + details.map((x) => `<li title="${esc(x.message || '')}">${esc(x.code || '')}${x.until ? ' →' + hzHM(x.until) : ''}</li>`).join('') + '</ul>' : ''}
+      ${details.map((x) => `<div class="hz-sub" style="margin:2px 0">· ${esc(x.message || '')}</div>`).join('')}
+    </div>`;
+  }
 }
 
 boot();
